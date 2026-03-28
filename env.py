@@ -5,183 +5,209 @@ import torch
 from sentence_transformers import SentenceTransformer, util
 
 class PhantomInkEnv(gym.Env):
-    metadata = {"render_modes": ["human"]}
-
-    MAX_TURNS = 8
+    """
+    A Gymnasium environment for the game Phantom Ink.
+    The agent acts as a medium trying to guess a target word by asking questions 
+    and receiving partial clues.
+    """
+    
+    # --- Constants ---
+    MAX_TURNS = 8.0
     MAX_CLUES = 8
     MAX_CHARS = 12
     MAX_QUESTIONS = 5
-
     PHASE_MAP = {"DECISION": 0, "THINKING": 1, "WRITING": 2}
 
     def __init__(self, word_data, render_mode=None):
         super().__init__()
+        
+        # 1. Data Setup
         self.word_data = word_data
         self.target_options = list(self.word_data.keys())
-        # Assumes uniform question keys across words
-        first_word = self.target_options[0]
-        self.questions = list(self.word_data[first_word].keys())
+        self.questions = list(self.word_data[self.target_options[0]].keys())
 
-        # NLP Setup - Moving to CPU/GPU explicitly for NumPy 2.0 compatibility with Torch
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # 2. NLP Model Setup (CPU for compatibility)
+        self.device = "cpu" 
         self.model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
 
-        self.target_embeddings = self.model.encode(self.target_options, convert_to_tensor=True)
-        self.question_embeddings = self.model.encode(self.questions, convert_to_tensor=True)
+        # 3. Embedding Cache (Pre-calculation for speed)
+        self._precompute_embeddings()
 
-        self.all_clue_words = sorted(list(set(
-            val.upper() for data in word_data.values() for val in data.values()
-        )))
-        self.clue_embeddings = self.model.encode(self.all_clue_words, convert_to_tensor=True)
-
-        # 0-4: Ask Question, 5: Request Letter, 6: End Clue, 7: Submit Guess
+        # 4. Gymnasium Spaces
         self.action_space = spaces.Discrete(8)
         emb_dim = self.model.get_sentence_embedding_dimension()
-
         self.observation_space = spaces.Dict({
-            "clues": spaces.Box(low=0, high=26, shape=(self.MAX_CLUES, self.MAX_CHARS), dtype=np.int32),
-            "phase": spaces.Discrete(3),
-            "turn": spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
-            "questions": spaces.Box(low=-np.inf, high=np.inf, shape=(self.MAX_QUESTIONS, emb_dim), dtype=np.float32)
+            "clues":         spaces.Box(low=0, high=26, shape=(8, 12), dtype=np.int32),
+            "phase":         spaces.Discrete(3),
+            "turn":          spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
+            "questions":     spaces.Box(low=-np.inf, high=np.inf, shape=(5, emb_dim), dtype=np.float32),
+            "question_mask": spaces.Box(low=0, high=1, shape=(5,), dtype=np.int32)
         })
 
-        self.render_mode = render_mode
+    def _precompute_embeddings(self):
+        """Encodes vocabulary and expected answers into tensors once at startup."""
+        # Vocabulary
+        self.all_clue_words = sorted(list(set(
+            val.upper() for data in self.word_data.values() for val in data.values()
+        )))
+        self.clue_vocab_embeddings = self.model.encode(self.all_clue_words, convert_to_tensor=True)
+
+        # Target Clues
+        dim = self.model.get_sentence_embedding_dimension()
+        self.expected_embeddings = torch.zeros(
+            (len(self.target_options), len(self.questions), dim), device=self.device
+        )
+        for t_idx, target in enumerate(self.target_options):
+            clues = [self.word_data[target][q].upper() for q in self.questions]
+            self.expected_embeddings[t_idx] = self.model.encode(clues, convert_to_tensor=True)
+
+        # Questions
+        self.question_embeddings = self.model.encode(self.questions, convert_to_tensor=True)
 
     def reset(self, seed=None, options=None):
-        # Gymnasium handles seeding via this call
+        """Resets the environment state for a new episode."""
         super().reset(seed=seed)
-
-        # Use self.np_random instead of np.random for reproducibility
+        
+        # Target Selection
         self.target_word = self.np_random.choice(self.target_options).upper()
-        self.clue_history = []
+        
+        # Game State
         self.current_turn = 0
         self.phase = "DECISION"
-
-        self.spirit_answer = ""
+        self.clue_history = []
+        self.q_text_history = []
         self.revealed_chars = ""
-        self.predicted_word = ""
         self.guess_progress = 0
+        self.active_q_text = None
+        self.spirit_answer = ""
+        self.prev_turn_guessed = False
 
+        # Question Deck
         self.all_q_indices = np.arange(len(self.questions))
         self.np_random.shuffle(self.all_q_indices)
-
-        self.active_q_indices = self.all_q_indices[-self.MAX_QUESTIONS:].copy()
-        self.unused_ptr = len(self.all_q_indices) - self.MAX_QUESTIONS - 1
-
-        self.question_history = []
-        self.active_turn_question = None
-
-        self.lettersKnown = []
-
+        self.active_q_indices = self.all_q_indices[:self.MAX_QUESTIONS].copy()
+        
         return self._get_obs(), {}
 
     def step(self, action):
+        """Applies the action and transitions the environment state."""
         reward = 0.0
         terminated = False
         truncated = False
-        info = {}
 
+        # 1. Edge Case: Forced Guess
         if self.current_turn == self.MAX_TURNS - 1 and self.phase == "DECISION":
-          action = 7
+            action = 7
 
+        # 2. Validation Checks
         if not self._is_action_valid(action) and self.phase != "WRITING":
-            return self._get_obs(), -7.0, False, True, {"error": "invalid_action_phase"}
+            return self._get_obs(), -50.0, False, True, {"error": "invalid_action_phase"}
 
         if self.current_turn > self.MAX_TURNS:
-            return self._get_obs(), -15.0, False, True, {"error": "out_of_turns"}
+            return self._get_obs(), -50.0, False, True, {"error": "out_of_turns"}
 
+        if self.phase == "DECISION" and action == 7 and len(self.clue_history) == 0:
+            return self._get_obs(), -50.0, False, True, {"error": "no_info_guess"}
+
+        # 3. Main State Machine
         if self.phase == "DECISION":
-            if 0 <= action <= 4:
-                actual_q_idx = self.active_q_indices[action]
-                self.active_turn_question = self.question_embeddings[actual_q_idx]
-                q_text = self.questions[actual_q_idx]
-
-                self.spirit_answer = self.word_data[self.target_word][q_text].upper()
-
-                # Update question hand
-                new_q_idx = self.all_q_indices[self.unused_ptr]
-                self.active_q_indices[action] = new_q_idx
-
-                self.unused_ptr -= 1
-                if self.unused_ptr < 0:
-                    self.unused_ptr = len(self.all_q_indices) - self.MAX_QUESTIONS - 1
-
-                self.phase = "THINKING"
-                self.current_turn += 1
-                reward = -1 * float(self.current_turn) / self.MAX_TURNS
-                reward += 0.1
-
-            elif action == 7:
-                self.current_turn += 1
-                self.phase = "WRITING"
-                reward = 0.5
-
+            reward = self._handle_decision_phase(action)
         elif self.phase == "THINKING":
-            if action == 5:  # "Next Letter"
-                if len(self.revealed_chars) < len(self.spirit_answer):
-                    self.revealed_chars += self.spirit_answer[len(self.revealed_chars)]
-                    reward = -0.05
-                else:
-                    self.phase = "DECISION"
-                    reward = -0.5
-
-            elif action == 6: # "Stop Writing"
-                if self.revealed_chars:
-                    self.clue_history.append(self.revealed_chars)
-                    reward = 1.0 + (0.2 * len(self.revealed_chars))
-                    self.question_history.append(self.active_turn_question)
-
-                self.revealed_chars = ""
-                self.active_turn_question = None
-                self.phase = "DECISION"
-            if self.current_turn == self.MAX_TURNS:
-                reward = -15.0
-                truncated = True
-
+            reward, truncated = self._handle_thinking_phase(action)
         elif self.phase == "WRITING":
-            char = self._get_predicted_char()
+            reward, terminated = self._handle_writing_phase(action)
 
-            if char == self.target_word[self.guess_progress]:
-                self.guess_progress += 1
-                if len(self.lettersKnown) < self.guess_progress:
-                  self.lettersKnown.append(char)
-                reward = 5.0
+        return self._get_obs(), float(reward), terminated, truncated, {}
 
-                if self.guess_progress == len(self.target_word):
-                    reward = 50.0
-                    terminated = True
+    # --- Phase Handlers ---
+
+    def _handle_decision_phase(self, action):
+        if 0 <= action <= 4:
+            q_idx = self.active_q_indices[action]
+            self.active_q_text = self.questions[q_idx]
+            self.spirit_answer = self.word_data[self.target_word][self.active_q_text].upper()
+            self.phase = "THINKING"
+            self.current_turn += 1
+            self.prev_turn_guessed = False
+            return 0.5
+        elif action == 7:
+            self.prev_turn_guessed = True
+            self.current_turn += 1
+            self.phase = "WRITING"
+            return 0.0
+        return 0.0
+
+    def _handle_thinking_phase(self, action):
+        reward = 0.0
+        truncated = False
+        
+        if action == 5: # Next Letter
+            if len(self.revealed_chars) < len(self.spirit_answer):
+                self.revealed_chars += self.spirit_answer[len(self.revealed_chars)]
+                reward = -0.1
             else:
-                reward = -0.5 * (self.guess_progress + 1)
-                self.guess_progress = 0
-                self.predicted_word = ""
                 self.phase = "DECISION"
-            if self.current_turn == self.MAX_TURNS:
-                truncated = not terminated
+        elif action == 6: # Stop Writing
+            if self.revealed_chars:
+                self.clue_history.append(self.revealed_chars)
+                self.q_text_history.append(self.active_q_text)
+                reward = 1.0 + (0.1 * len(self.revealed_chars))
+            self.revealed_chars = ""
+            self.phase = "DECISION"
+        
+        if self.current_turn == self.MAX_TURNS:
+            reward = -15.0
+            truncated = True
+        return reward, truncated
 
-        return self._get_obs(), float(reward), terminated, truncated, info
+    def _handle_writing_phase(self, action):
+        reward = 0.0
+        terminated = False
+        
+        char = self._get_predicted_char()
+        if char == self.target_word[self.guess_progress]:
+            self.guess_progress += 1
+            reward = 5.0
+            if self.guess_progress == len(self.target_word):
+                reward = 100.0
+                terminated = True
+        else:
+            reward = -15.0
+            self.guess_progress = 0
+            self.phase = "DECISION"
+            if self.current_turn == self.MAX_TURNS:
+                terminated = True
+        return reward, terminated
+
+    # --- Helper Methods ---
 
     def _get_obs(self):
-        grid = np.zeros((self.MAX_CLUES, self.MAX_CHARS), dtype=np.int32)
-
-        for i, clue in enumerate(self.clue_history[:self.MAX_CLUES-1]):
-            for j, char in enumerate(clue[:self.MAX_CHARS]):
+        """Constructs the observation dictionary for the agent."""
+        grid = np.zeros((8, 12), dtype=np.int32)
+        
+        # Fill clue history into grid
+        for i, clue in enumerate(self.clue_history[:7]):
+            for j, char in enumerate(clue[:12]):
                 grid[i, j] = ord(char) - ord('A') + 1
+        
+        # Current partial clue in the last row
+        for j, char in enumerate(self.revealed_chars[:12]):
+            grid[7, j] = ord(char) - ord('A') + 1
 
-        for j, char in enumerate(self.revealed_chars[:self.MAX_CHARS]):
-            grid[self.MAX_CLUES-1, j] = ord(char) - ord('A') + 1
-
-        active_embs = self.question_embeddings[self.active_q_indices].cpu().numpy()
+        active_embs = self.question_embeddings[self.active_q_indices].detach().cpu().numpy()
 
         return {
-            "clues": grid,
-            "phase": self.PHASE_MAP[self.phase],
-            "turn": np.array([float(self.current_turn) / self.MAX_TURNS], dtype=np.float32),
-            "questions": active_embs.astype(np.float32)
+            "clues":         grid,
+            "phase":         self.PHASE_MAP[self.phase],
+            "turn":          np.array([self.current_turn / self.MAX_TURNS], dtype=np.float32),
+            "questions":     active_embs.astype(np.float32),
+            "question_mask": np.ones(5, dtype=np.int32)
         }
 
     def _is_action_valid(self, action):
+        """Checks if the chosen action is legal in the current game state."""
         if self.phase == "DECISION":
-            return (0 <= action <= 4) or action == 7
+            return (0 <= action <= 4) or (action == 7 and not self.prev_turn_guessed)
         if self.phase == "THINKING":
             return action in [5, 6]
         if self.phase == "WRITING":
@@ -189,54 +215,28 @@ class PhantomInkEnv(gym.Env):
         return False
 
     def _get_predicted_char(self):
-        # 1. Use existing predicted_word if it matches our current progress
-        if self.predicted_word and self.guess_progress < len(self.predicted_word):
-            # Verify the predicted word still matches what we know to be true
-            known_prefix = "".join(self.lettersKnown)
-            if self.predicted_word.startswith(known_prefix):
-                return self.predicted_word[self.guess_progress]
+        """Simulates the medium's internal deduction using semantic similarity."""
+        known_prefix = self.target_word[:self.guess_progress]
+        valid_indices = [i for i, t in enumerate(self.target_options) if t.upper().startswith(known_prefix)]
 
-        # 2. If no clues yet, we are just throwing darts
-        if not self.clue_history:
-            return chr(self.np_random.integers(65, 91))
+        if self.clue_history:
+            SIM_THRESHOLD = 0.6
+            for fragment, q_text in zip(self.clue_history, self.q_text_history):
+                q_idx = self.questions.index(q_text)
+                match_vocab_mask = [w.startswith(fragment) for w in self.all_clue_words]
+                if not any(match_vocab_mask): continue
+                
+                candidate_embs = self.clue_vocab_embeddings[match_vocab_mask]
+                current_filtered = []
+                for t_idx in valid_indices:
+                    expected_emb = self.expected_embeddings[t_idx, q_idx].unsqueeze(0)
+                    scores = util.cos_sim(expected_emb, candidate_embs)
+                    if torch.max(scores) >= SIM_THRESHOLD:
+                        current_filtered.append(t_idx)
+                if current_filtered:
+                    valid_indices = current_filtered
 
-        # 3. Filter the target options based on lettersKnown
-        known_prefix = "".join(self.lettersKnown)
-        valid_indices = [
-            i for i, word in enumerate(self.target_options)
-            if word.upper().startswith(known_prefix)
-        ]
-
-        # If for some reason no words match, fall back to all options
-        # (though this shouldn't happen if lettersKnown is accurate)
-        if not valid_indices:
-            valid_indices = list(range(len(self.target_options)))
-
-        # 4. Generate the context vector from clue history (your existing logic)
-        combined_turn_vecs = []
-        for fragment, q_emb in zip(self.clue_history, self.question_history):
-            matches = [i for i, w in enumerate(self.all_clue_words) if w.startswith(fragment)]
-            if matches:
-                clue_vec = torch.mean(self.clue_embeddings[matches], dim=0)
-                combined_vec = (clue_vec + 0.5 * q_emb) / 2
-                combined_turn_vecs.append(combined_vec)
-
-        if not combined_turn_vecs:
-            return chr(self.np_random.integers(65, 91))
-
-        context = torch.mean(torch.stack(combined_turn_vecs), dim=0).unsqueeze(0)
-
-        # 5. Only score against words that match our known prefix
-        filtered_embeddings = self.target_embeddings[valid_indices]
-        scores = util.cos_sim(context, filtered_embeddings)[0]
-
-        # Map the best score back to the original target_options list
-        best_filtered_idx = torch.argmax(scores).item()
-        actual_idx = valid_indices[best_filtered_idx]
-
-        self.predicted_word = self.target_options[actual_idx].upper()
-
-        # Return the next character in the best matching word
-        if self.guess_progress < len(self.predicted_word):
-            return self.predicted_word[self.guess_progress]
-        return chr(self.np_random.integers(65, 91))
+        chosen_idx = self.np_random.choice(valid_indices) if valid_indices else self.np_random.integers(len(self.target_options))
+        predicted_word = self.target_options[chosen_idx].upper()
+        
+        return predicted_word[self.guess_progress] if self.guess_progress < len(predicted_word) else " "
